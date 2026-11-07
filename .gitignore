@@ -1,0 +1,12 @@
+# makepkg build artifacts
+pkg/
+src/
+*.pkg.tar.*
+*.log
+
+# Compiled binaries and objects
+*.o
+*.so
+tools/test_true_spi
+*.pgm
+*.bin

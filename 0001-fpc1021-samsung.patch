@@ -1,0 +1,931 @@
+diff --git a/libfprint/drivers/fpc1021_samsung.c b/libfprint/drivers/fpc1021_samsung.c
+new file mode 100644
+index 0000000..a0edced
+--- /dev/null
++++ b/libfprint/drivers/fpc1021_samsung.c
+@@ -0,0 +1,901 @@
++/*
++ * Samsung FPC1021/FPC1025 Linux libfprint Driver
++ * Reverse-engineered from fpc_wbdi.dll for Samsung Notebook 9 Always (04e8:7301)
++ *
++ * Copyright (C) 2026 Kyungmin Cho / Antigravity
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#define FP_COMPONENT "fpc1021_samsung"
++#include <stdio.h>
++#include "fpi-log.h"
++#include "drivers_api.h"
++
++#define FPC1021_VID 0x04e8
++#define FPC1021_PID 0x7301
++
++#define EP_OUT (0x01 | FPI_USB_ENDPOINT_OUT)
++#define EP_IN  (0x02 | FPI_USB_ENDPOINT_IN)
++
++#define WIDTH  160
++#define HEIGHT 160
++#define FRAME_SIZE (WIDTH * HEIGHT)
++#define ENLARGE_FACTOR 2
++
++/* Loop SSM states */
++enum {
++  M_WAIT_FINGER,
++  M_CHECK_FINGER,
++  M_CAPTURE_PREPARE,
++  M_CAPTURE_READ,
++  M_SUBMIT_IMAGE,
++  M_LOOP_NUM_STATES,
++};
++
++struct _FpiDeviceFpc1021Samsung
++{
++  FpImageDevice parent;
++  FpiSsm       *ssm;
++  guint8       *frame_buf;
++  gboolean      deactivating;
++  GSource      *finger_off_source;
++  guint8        shift_table[32];
++  guint16       gain_table[16];
++  guint8        pxl_idx;
++};
++
++G_DECLARE_FINAL_TYPE (FpiDeviceFpc1021Samsung, fpi_device_fpc1021_samsung, FPI, DEVICE_FPC1021_SAMSUNG, FpImageDevice);
++G_DEFINE_TYPE (FpiDeviceFpc1021Samsung, fpi_device_fpc1021_samsung, FP_TYPE_IMAGE_DEVICE);
++
++static gboolean
++safe_usb_submit_sync (FpiUsbTransfer *transfer, guint timeout_ms, GError **error)
++{
++  GError *local_err = NULL;
++  gboolean ok = fpi_usb_transfer_submit_sync (transfer, timeout_ms, &local_err);
++  if (!ok && local_err)
++    {
++      if (error && *error == NULL)
++        *error = g_error_copy (local_err);
++      g_clear_error (&local_err);
++    }
++  return ok;
++}
++
++static void
++async_out_cb (FpiUsbTransfer *transfer G_GNUC_UNUSED,
++              FpDevice       *dev G_GNUC_UNUSED,
++              gpointer        user_data G_GNUC_UNUSED,
++              GError         *error)
++{
++  if (error)
++    g_error_free (error);
++}
++
++/* GPIO reset sequence matching 0x1800041fe in fpc_wbdi.dll */
++static gboolean
++hw_reset (FpDevice *dev, GError **error)
++{
++  g_autoptr(FpiUsbTransfer) t1 = fpi_usb_transfer_new (dev);
++  fpi_usb_transfer_fill_control (t1,
++                                 G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
++                                 G_USB_DEVICE_REQUEST_TYPE_VENDOR,
++                                 G_USB_DEVICE_RECIPIENT_DEVICE,
++                                 0xDB, 6, 0, 0);
++  if (!safe_usb_submit_sync (t1, 1000, error))
++    return FALSE;
++
++  g_usleep (5000);
++
++  g_autoptr(FpiUsbTransfer) t2 = fpi_usb_transfer_new (dev);
++  fpi_usb_transfer_fill_control (t2,
++                                 G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
++                                 G_USB_DEVICE_REQUEST_TYPE_VENDOR,
++                                 G_USB_DEVICE_RECIPIENT_DEVICE,
++                                 0xDB, 6, 1, 0);
++  if (!safe_usb_submit_sync (t2, 1000, error))
++    return FALSE;
++
++  g_usleep (20000);
++  return TRUE;
++}
++
++/* Read IRQ GPIO pin via bridge vendor command 0xDA (0x180008074) */
++static gint
++bridge_read_irq (FpDevice *dev)
++{
++  g_autoptr(FpiUsbTransfer) t = fpi_usb_transfer_new (dev);
++  fpi_usb_transfer_fill_control (t,
++                                 G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST,
++                                 G_USB_DEVICE_REQUEST_TYPE_VENDOR,
++                                 G_USB_DEVICE_RECIPIENT_DEVICE,
++                                 0xDA, 7, 0, 2);
++  if (!safe_usb_submit_sync (t, 1000, NULL))
++    return -1;
++  if (t->actual_length == 2 && t->buffer[0] == 0)
++    return t->buffer[1];
++  return -1;
++}
++
++/*
++ * Full-duplex SPI transaction via FpcG2Usb bridge (0x18000acf4 & 0x18000b290):
++ * 1. 0x40, 0xC3, 0, 0 (16 bytes): Configure 3 MHz, 8-bit SPI bus (0x180008458)
++ * 2. 0x40, 0xCA, 3, len (0 bytes): Set SPI CS_N byte length (0x1800086fc)
++ * 3. Bulk OUT (EP 0x01) + Bulk IN (EP 0x82)
++ */
++static gboolean
++fpc_xfer (FpDevice *dev, const guint8 *tx, guint8 *rx, gsize len, GError **error)
++{
++  static const guint8 spi_cfg[16] = {
++    0xC0, 0xC6, 0x2D, 0x00,
++    0x08, 0x00, 0xFF, 0x01,
++    0x01, 0x01, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00
++  };
++
++  g_autoptr(FpiUsbTransfer) t_c3 = fpi_usb_transfer_new (dev);
++  fpi_usb_transfer_fill_control (t_c3,
++                                 G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
++                                 G_USB_DEVICE_REQUEST_TYPE_VENDOR,
++                                 G_USB_DEVICE_RECIPIENT_DEVICE,
++                                 0xC3, 0, 0, 16);
++  memcpy (t_c3->buffer, spi_cfg, 16);
++  if (!safe_usb_submit_sync (t_c3, 1000, error))
++    return FALSE;
++
++  g_autoptr(FpiUsbTransfer) t_ca = fpi_usb_transfer_new (dev);
++  fpi_usb_transfer_fill_control (t_ca,
++                                 G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
++                                 G_USB_DEVICE_REQUEST_TYPE_VENDOR,
++                                 G_USB_DEVICE_RECIPIENT_DEVICE,
++                                 0xCA, 3, (guint16) len, 0);
++  if (!safe_usb_submit_sync (t_ca, 1000, error))
++    return FALSE;
++
++  if (len <= 512)
++    {
++      g_autoptr(FpiUsbTransfer) t_out = fpi_usb_transfer_new (dev);
++      fpi_usb_transfer_fill_bulk_full (t_out, EP_OUT, (guint8 *) tx, len, NULL);
++      if (!safe_usb_submit_sync (t_out, 2000, error))
++        return FALSE;
++    }
++  else
++    {
++      /* For large SPI transfers (25602-byte frame read), submit Bulk OUT async
++       * so Bulk IN can drain the 576-byte bridge FIFO concurrently. */
++      FpiUsbTransfer *t_out = fpi_usb_transfer_new (dev);
++      fpi_usb_transfer_fill_bulk (t_out, EP_OUT, len);
++      memcpy (t_out->buffer, tx, len);
++      fpi_usb_transfer_submit (t_out, 4000, NULL, async_out_cb, NULL);
++    }
++
++  gsize got = 0;
++  while (got < len)
++    {
++      gsize rem = len - got;
++      g_autoptr(FpiUsbTransfer) t_in = fpi_usb_transfer_new (dev);
++      fpi_usb_transfer_fill_bulk (t_in, EP_IN, rem);
++      if (!safe_usb_submit_sync (t_in, 4000, error))
++        return FALSE;
++
++      if (t_in->actual_length <= 0)
++        break;
++
++      gsize chunk = (gsize) t_in->actual_length;
++      gsize to_copy = (got + chunk > len) ? (len - got) : chunk;
++      if (rx)
++        memcpy (rx + got, t_in->buffer, to_copy);
++      got += to_copy;
++    }
++
++  return (got == len);
++}
++
++static gboolean
++fpc_reg_write (FpDevice *dev, const guint8 *data, gsize len, GError **error)
++{
++  return fpc_xfer (dev, data, NULL, len, error);
++}
++
++static gboolean
++fpc_reg_read (FpDevice *dev, guint8 opcode, gsize dummy_bytes, guint8 *out, gsize len, GError **error)
++{
++  gsize total = 1 + dummy_bytes + len;
++  g_autofree guint8 *tx = g_malloc0 (total);
++  g_autofree guint8 *rx = g_malloc0 (total);
++
++  tx[0] = opcode;
++  if (!fpc_xfer (dev, tx, rx, total, error))
++    return FALSE;
++
++  if (out)
++    memcpy (out, rx + 1 + dummy_bytes, len);
++  return TRUE;
++}
++
++/* Execute 1-byte command, wait for IRQ pin, and read/clear 0x1C (0x180008164) */
++static gboolean
++fpc_cmd (FpDevice *dev, guint8 opcode, guint8 *irq_out, GError **error)
++{
++  if (!fpc_xfer (dev, &opcode, NULL, 1, error))
++    return FALSE;
++
++  for (int i = 0; i < 30; i++)
++    {
++      if (bridge_read_irq (dev) > 0)
++        {
++          guint8 st = 0;
++          fpc_reg_read (dev, 0x1C, 0, &st, 1, NULL);
++          if (irq_out)
++            *irq_out = st;
++          return TRUE;
++        }
++      g_usleep (1000);
++    }
++
++  guint8 st = 0;
++  fpc_reg_read (dev, 0x1C, 0, &st, 1, NULL);
++  if (irq_out)
++    *irq_out = st;
++  return TRUE;
++}
++
++static gboolean
++fpc_set_pxlctrl (FpDevice *dev, guint8 idx, GError **error)
++{
++  static const guint8 pxl_tbl[4] = {0x1E, 0x0E, 0x1A, 0x0A};
++  guint8 pkt[3] = {0xA8, 0x0F, pxl_tbl[idx & 3]};
++  return fpc_reg_write (dev, pkt, sizeof (pkt), error);
++}
++
++static gboolean
++fpc_set_afd_mode (FpDevice *dev, GError **error)
++{
++  /* Matches 0x180004074 / 0x180004641 / 0x1800034c7 in fpc_wbdi.dll */
++  static const guint8 afd_a8[] = {0xA8, 0x0F, 0x0A};
++  static const guint8 afd_a0[] = {0xA0, 0x0A, 0x02};
++  if (!fpc_reg_write (dev, afd_a8, sizeof (afd_a8), error))
++    return FALSE;
++  return fpc_reg_write (dev, afd_a0, sizeof (afd_a0), error);
++}
++
++/* Query active AFD touch zones (0..12) matching 0x180007324 */
++static gint
++fpc_query_finger_zones (FpDevice *dev)
++{
++  guint8 irq = 0;
++  guint8 d4[4] = {0};
++
++  if (!fpc_cmd (dev, 0x20, &irq, NULL))
++    return 0;
++  if (!fpc_reg_read (dev, 0xD4, 0, d4, 4, NULL))
++    return 0;
++
++  guint16 mask = (((guint16) d4[0] << 8) | d4[1]) & 0x0FFF;
++  return __builtin_popcount (mask);
++}
++
++static gint
++avg_bytes (const guint8 *buf, gint len)
++{
++  gint sum = 0;
++  for (gint i = 0; i < len; i++)
++    sum += buf[i];
++  return sum / len;
++}
++
++static void
++hist_bounds (const guint8 *buf, gint len, gint *p_low, gint *p_high)
++{
++  guint16 hist[256] = {0};
++  for (gint i = 0; i < len; i++)
++    hist[buf[i]]++;
++
++  gint sum_lo = 0, sum_hi = 0;
++  *p_low = -1;
++  *p_high = -1;
++  for (gint i = 0; i < 256; i++)
++    {
++      sum_lo += hist[i];
++      sum_hi += hist[255 - i];
++      if (sum_lo > 1 && *p_low < 0)
++        *p_low = i;
++      if (sum_hi > 1 && *p_high < 0)
++        *p_high = 255 - i;
++    }
++  if (*p_low < 0)
++    *p_low = 0;
++  if (*p_high < 0)
++    *p_high = 255;
++}
++
++/* Calibrate ADC shift & gain tables (0x180003694) */
++static gboolean
++fpc_calibrate_adc (FpiDeviceFpc1021Samsung *self, GError **error)
++{
++  FpDevice *dev = FP_DEVICE (self);
++  guint8 sub[448];
++  guint8 irq = 0;
++
++  static const guint8 r_78[] = {0x78, 0xFF, 0xFF};
++  static const guint8 r_8c_test[] = {0x8C, 0x04};
++  static const guint8 r_54_sub[] = {0x54, 0x20, 0x0E, 0x08, 0x20};
++
++  if (!fpc_reg_write (dev, r_78, sizeof (r_78), error) ||
++      !fpc_reg_write (dev, r_8c_test, sizeof (r_8c_test), error) ||
++      !fpc_set_pxlctrl (dev, 0, error) ||
++      !fpc_reg_write (dev, r_54_sub, sizeof (r_54_sub), error))
++    return FALSE;
++
++  gint prev_avg = 0;
++  guint8 sil = 0;
++  for (gint s = 0; s < 32; s++)
++    {
++      guint8 r_a0[3] = {0xA0, (guint8) s, 0x00};
++      if (!fpc_reg_write (dev, r_a0, sizeof (r_a0), error) ||
++          !fpc_cmd (dev, 0xC0, &irq, error) ||
++          !fpc_reg_read (dev, 0xC4, 1, sub, sizeof (sub), error))
++        return FALSE;
++
++      gint avg = avg_bytes (sub, sizeof (sub));
++      if (prev_avg < 200 && avg >= 200)
++        sil = (guint8) s;
++      self->shift_table[s] = (guint8) (avg - prev_avg);
++      prev_avg = avg;
++    }
++
++  self->gain_table[0] = 1000;
++  gboolean need_base = TRUE;
++  gint base_avg = 0;
++  for (gint g = 0; g < 15; g++)
++    {
++      if (need_base)
++        {
++          guint8 r_a0[3] = {0xA0, sil, (guint8) g};
++          if (!fpc_reg_write (dev, r_a0, sizeof (r_a0), error) ||
++              !fpc_cmd (dev, 0xC0, &irq, error) ||
++              !fpc_reg_read (dev, 0xC4, 1, sub, sizeof (sub), error))
++            return FALSE;
++          base_avg = avg_bytes (sub, sizeof (sub));
++          need_base = FALSE;
++        }
++
++      guint8 r_a0_next[3] = {0xA0, sil, (guint8) (g + 1)};
++      if (!fpc_reg_write (dev, r_a0_next, sizeof (r_a0_next), error) ||
++          !fpc_cmd (dev, 0xC0, &irq, error) ||
++          !fpc_reg_read (dev, 0xC4, 1, sub, sizeof (sub), error))
++        return FALSE;
++
++      gint next_avg = avg_bytes (sub, sizeof (sub));
++      gint c0 = base_avg < 128 ? 128 : base_avg;
++      gint c1 = next_avg < 129 ? 129 : next_avg;
++      self->gain_table[g + 1] = (guint16) (((c1 - 127) * 1000) / (c0 - 127));
++      base_avg = c1;
++      while (base_avg > 200 && sil > 0)
++        {
++          sil--;
++          need_base = TRUE;
++          base_avg -= self->shift_table[sil];
++        }
++    }
++
++  /* Restore normal FPC2050 external finger drive (0x180007258) */
++  static const guint8 r_54_full[] = {0x54, 0x00, 0xA0, 0x00, 0xA0};
++  static const guint8 r_8c_norm[] = {0x8C, 0x12};
++  if (!fpc_reg_write (dev, r_54_full, sizeof (r_54_full), error) ||
++      !fpc_reg_write (dev, r_8c_norm, sizeof (r_8c_norm), error) ||
++      !fpc_set_pxlctrl (dev, 2, error))
++    return FALSE;
++
++  return TRUE;
++}
++
++/* Closed-loop Auto Gain / Shift / Pixel-Drive Control (0x180003a30) */
++static gboolean
++fpc_auto_gain_control (FpiDeviceFpc1021Samsung *self, GError **error)
++{
++  FpDevice *dev = FP_DEVICE (self);
++  guint8 sub[448];
++  guint8 irq = 0;
++
++  static const guint8 r_54_sub[] = {0x54, 73, 14, 64, 32};
++  static const guint8 r_a0_init[] = {0xA0, 0x10, 0x00};
++  static const guint8 r_64_sub[] = {0x64, 0x0C};
++  static const guint8 r_5c_sub[] = {0x5C, 0x0A};
++
++  if (!fpc_reg_write (dev, r_54_sub, sizeof (r_54_sub), error) ||
++      !fpc_reg_write (dev, r_a0_init, sizeof (r_a0_init), error) ||
++      !fpc_set_pxlctrl (dev, self->pxl_idx, error) ||
++      !fpc_reg_write (dev, r_64_sub, sizeof (r_64_sub), error) ||
++      !fpc_reg_write (dev, r_5c_sub, sizeof (r_5c_sub), error) ||
++      !fpc_cmd (dev, 0xC0, &irq, error) ||
++      !fpc_reg_read (dev, 0xC4, 1, sub, sizeof (sub), error))
++    return FALSE;
++
++  gint zeros = 0, ones = 0;
++  for (gsize i = 0; i < sizeof (sub); i++)
++    {
++      if (sub[i] == 0x00) zeros++;
++      if (sub[i] == 0xFF) ones++;
++    }
++
++  gint p_lo = 0, p_hi = 255;
++  hist_bounds (sub, sizeof (sub), &p_lo, &p_hi);
++  gint mid1 = (p_hi + p_lo) / 2;
++
++  guint8 next_idx = self->pxl_idx;
++  if (next_idx < 3 && (mid1 > 0xA2 || ones > 10))
++    next_idx++;
++  else if (next_idx > 0 && (mid1 < 0x76 || zeros > 10))
++    next_idx--;
++
++  if (next_idx != self->pxl_idx)
++    {
++      self->pxl_idx = next_idx;
++      if (!fpc_set_pxlctrl (dev, self->pxl_idx, error) ||
++          !fpc_cmd (dev, 0xC0, &irq, error) ||
++          !fpc_reg_read (dev, 0xC4, 1, sub, sizeof (sub), error))
++        return FALSE;
++      hist_bounds (sub, sizeof (sub), &p_lo, &p_hi);
++      mid1 = (p_hi + p_lo) / 2;
++    }
++
++  fpc_query_finger_zones (dev);
++
++  if (!fpc_cmd (dev, 0xC0, &irq, error) ||
++      !fpc_reg_read (dev, 0xC4, 1, sub, sizeof (sub), error))
++    return FALSE;
++
++  gint p_lo2 = 0, p_hi2 = 255;
++  hist_bounds (sub, sizeof (sub), &p_lo2, &p_hi2);
++  gint mid2 = (p_hi2 + p_lo2) / 2;
++
++  gint diff = mid1 - mid2;
++  gint target = 0xA2;
++  if (diff < 0) target = 0x7D;
++  else if (diff > 13) target = 0xA2;
++  else if (diff > 8) target = 0x9B;
++  else if (diff > 6) target = 0x96;
++  else if (diff > 3) target = 0x91;
++  else target = 0x82;
++
++  guint8 shift = 0x10;
++  gint val = mid2;
++  if (val < target)
++    {
++      while (val < target && shift < 0x1F)
++        {
++          shift++;
++          val += self->shift_table[shift];
++        }
++    }
++  else if (val > target)
++    {
++      while (val > target && shift > 1)
++        {
++          shift--;
++          val -= self->shift_table[shift];
++        }
++    }
++
++  gint span = p_hi2 - p_lo2;
++  guint8 gain = 0;
++  while (gain < 0x0F)
++    {
++      span = (span * self->gain_table[gain]) / 1000;
++      if (span > 0x84)
++        break;
++      gain++;
++    }
++
++  fp_dbg ("AGC: pxl_idx=%u mid1=%d mid2=%d span=%d -> shift=0x%02X gain=0x%02X",
++          self->pxl_idx, mid1, mid2, p_hi2 - p_lo2, shift, gain);
++
++  guint8 r_a0_final[] = {0xA0, shift, gain};
++  static const guint8 r_64_full[] = {0x64, 0x1E};
++  static const guint8 r_5c_full[] = {0x5C, 0x0B};
++  static const guint8 r_54_full[] = {0x54, 0x00, 0xA0, 0x00, 0xA0};
++
++  if (!fpc_reg_write (dev, r_a0_final, sizeof (r_a0_final), error) ||
++      !fpc_reg_write (dev, r_64_full, sizeof (r_64_full), error) ||
++      !fpc_reg_write (dev, r_5c_full, sizeof (r_5c_full), error) ||
++      !fpc_reg_write (dev, r_54_full, sizeof (r_54_full), error))
++    return FALSE;
++
++  return TRUE;
++}
++
++/* 8-column ADC multiplexer boundary offset correction (0x180006fe8) */
++static void
++fpc_correct_column_offsets (guint8 *img, gint width, gint height)
++{
++  gint sum_bound = 0, cnt_bound = 0;
++  gint sum_inter = 0, cnt_inter = 0;
++
++  for (gint y = 0; y < height; y++)
++    {
++      const guint8 *row = img + y * width;
++      for (gint x = 0; x < width; x++)
++        {
++          if (x > 1 && x < width - 4 && ((x & 7) == 0 || (x & 7) == 7))
++            {
++              sum_bound += row[x];
++              cnt_bound++;
++            }
++          else
++            {
++              sum_inter += row[x];
++              cnt_inter++;
++            }
++        }
++    }
++
++  if (cnt_bound == 0 || cnt_inter == 0)
++    return;
++
++  gint diff = (sum_inter / cnt_inter) - (sum_bound / cnt_bound);
++  if (diff >= 1 && diff <= 28)
++    {
++      for (gint y = 0; y < height; y++)
++        {
++          guint8 *row = img + y * width;
++          for (gint x = 0; x < width; x++)
++            {
++              if (x > 1 && x < width - 4 && ((x & 7) == 0 || (x & 7) == 7))
++                {
++                  gint v = row[x] + diff;
++                  if (v < 255)
++                    row[x] = (guint8) v;
++                }
++            }
++        }
++    }
++}
++
++static gboolean
++fpc_init_sensor (FpDevice *dev, GError **error)
++{
++  FpiDeviceFpc1021Samsung *self = FPI_DEVICE_FPC1021_SAMSUNG (dev);
++  guint8 irq = 0;
++  guint8 hwid[2] = {0};
++
++  self->pxl_idx = 2;
++
++  if (!hw_reset (dev, error))
++    return FALSE;
++
++  if (!fpc_cmd (dev, 0xF8, &irq, error))
++    return FALSE;
++
++  if (!fpc_reg_read (dev, 0xFC, 0, hwid, 2, error))
++    return FALSE;
++
++  fp_dbg ("FPC1025 HWID=0x%02X%02X, IRQ=0x%02X", hwid[0], hwid[1], irq);
++
++  /* Exact FPC1025 (swing = 1) initialization table from 0x180005ee4 */
++  static const guint8 r_9c[] = {0x9C, 0x55, 0x40, 0x00, 0x2D, 0x24};
++  static const guint8 r_6c[] = {0x6C, 0x29};
++  static const guint8 r_90[] = {0x90, 0x32};
++  static const guint8 r_68[] = {0x68, 0x31, 0x31, 0x31, 0x31, 0x3D, 0x3D, 0x3D, 0x3D};
++  static const guint8 r_98[] = {0x98, 0x03, 0xEB, 0x3F, 0xB8, 0x0A, 0x07, 0x11, 0x22, 0x6A, 0x5D};
++  static const guint8 r_8c[] = {0x8C, 0x12};
++  static const guint8 r_5c[] = {0x5C, 0x0B};
++  static const guint8 r_d8[] = {0xD8, 0x20};
++  static const guint8 r_dc[] = {0xDC, 0x00, 0x0A};
++
++  if (!fpc_reg_write (dev, r_9c, sizeof (r_9c), error) ||
++      !fpc_reg_write (dev, r_6c, sizeof (r_6c), error) ||
++      !fpc_reg_write (dev, r_90, sizeof (r_90), error) ||
++      !fpc_reg_write (dev, r_68, sizeof (r_68), error) ||
++      !fpc_reg_write (dev, r_98, sizeof (r_98), error) ||
++      !fpc_reg_write (dev, r_8c, sizeof (r_8c), error) ||
++      !fpc_reg_write (dev, r_5c, sizeof (r_5c), error) ||
++      !fpc_reg_write (dev, r_d8, sizeof (r_d8), error) ||
++      !fpc_reg_write (dev, r_dc, sizeof (r_dc), error))
++    return FALSE;
++
++  if (!fpc_calibrate_adc (self, error))
++    return FALSE;
++
++  if (!fpc_set_afd_mode (dev, error))
++    return FALSE;
++
++  fp_dbg ("FPC1025 sensor initialized and ADC calibrated");
++  return TRUE;
++}
++
++static void
++finger_off_poll_cb (FpDevice *dev, gpointer user_data G_GNUC_UNUSED)
++{
++  FpImageDevice *img_dev = FP_IMAGE_DEVICE (dev);
++  FpiDeviceFpc1021Samsung *self = FPI_DEVICE_FPC1021_SAMSUNG (img_dev);
++
++  self->finger_off_source = NULL;
++  if (self->deactivating)
++    return;
++
++  fpc_set_afd_mode (dev, NULL);
++  gint pop = fpc_query_finger_zones (dev);
++  if (pop <= 1)
++    {
++      fp_dbg ("Finger lifted (active zones=%d)", pop);
++      fpi_image_device_report_finger_status (img_dev, FALSE);
++    }
++  else
++    {
++      self->finger_off_source = fpi_device_add_timeout (dev,
++                                                        50,
++                                                        finger_off_poll_cb,
++                                                        NULL,
++                                                        NULL);
++    }
++}
++
++static void
++fpc1021_samsung_dev_init (FpImageDevice *dev)
++{
++  FpiDeviceFpc1021Samsung *self = FPI_DEVICE_FPC1021_SAMSUNG (dev);
++  GError *error = NULL;
++
++  g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, &error);
++  if (error)
++    {
++      fpi_image_device_open_complete (dev, error);
++      return;
++    }
++
++  self->frame_buf = g_malloc0 (FRAME_SIZE);
++
++  if (!fpc_init_sensor (FP_DEVICE (dev), &error))
++    {
++      g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, NULL);
++      fpi_image_device_open_complete (dev, error);
++      return;
++    }
++
++  fpi_image_device_open_complete (dev, NULL);
++  fp_dbg ("Samsung FPC1025 open complete");
++}
++
++static void
++fpc1021_samsung_dev_deinit (FpImageDevice *dev)
++{
++  FpiDeviceFpc1021Samsung *self = FPI_DEVICE_FPC1021_SAMSUNG (dev);
++  GError *error = NULL;
++
++  g_clear_pointer (&self->finger_off_source, g_source_destroy);
++
++  fpc_cmd (FP_DEVICE (dev), 0x34, NULL, &error);
++  g_clear_error (&error);
++
++  g_clear_pointer (&self->frame_buf, g_free);
++  g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, &error);
++  fpi_image_device_close_complete (dev, error);
++  fp_dbg ("Samsung FPC1025 closed");
++}
++
++static void
++fpc1021_samsung_dev_activate (FpImageDevice *dev)
++{
++  FpiDeviceFpc1021Samsung *self = FPI_DEVICE_FPC1021_SAMSUNG (dev);
++  self->deactivating = FALSE;
++  fpi_image_device_activate_complete (dev, NULL);
++  fp_dbg ("Samsung FPC1025 activated");
++}
++
++static void
++fpc1021_samsung_dev_deactivate (FpImageDevice *dev)
++{
++  FpiDeviceFpc1021Samsung *self = FPI_DEVICE_FPC1021_SAMSUNG (dev);
++  self->deactivating = TRUE;
++  g_clear_pointer (&self->finger_off_source, g_source_destroy);
++  if (self->ssm == NULL)
++    fpi_image_device_deactivate_complete (dev, NULL);
++  fp_dbg ("Samsung FPC1025 deactivating...");
++}
++
++static void
++m_loop_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
++{
++  FpImageDevice *dev = FP_IMAGE_DEVICE (_dev);
++  FpiDeviceFpc1021Samsung *self = FPI_DEVICE_FPC1021_SAMSUNG (_dev);
++
++  self->ssm = NULL;
++
++  if (self->deactivating)
++    fpi_image_device_deactivate_complete (dev, NULL);
++  else if (error != NULL)
++    fpi_image_device_session_error (dev, error);
++}
++
++static void
++m_loop_state (FpiSsm *ssm, FpDevice *_dev)
++{
++  FpImageDevice *dev = FP_IMAGE_DEVICE (_dev);
++  FpiDeviceFpc1021Samsung *self = FPI_DEVICE_FPC1021_SAMSUNG (_dev);
++
++  if (self->deactivating)
++    {
++      fpi_ssm_mark_completed (ssm);
++      return;
++    }
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case M_WAIT_FINGER:
++      fpi_ssm_next_state_delayed (ssm, 40);
++      break;
++
++    case M_CHECK_FINGER:
++      {
++        fpc_set_afd_mode (_dev, NULL);
++        gint pop = fpc_query_finger_zones (_dev);
++        if (pop >= 6)
++          {
++            /* Confirm firm placement after 25ms settle delay (0x1800032ab) */
++            g_usleep (25000);
++            pop = fpc_query_finger_zones (_dev);
++          }
++
++        if (pop >= 6)
++          {
++            fp_dbg ("Finger touch confirmed! active zones=%d", pop);
++            fpi_image_device_report_finger_status (dev, TRUE);
++            fpi_ssm_next_state (ssm);
++          }
++        else
++          {
++            fpi_ssm_jump_to_state (ssm, M_WAIT_FINGER);
++          }
++      }
++      break;
++
++    case M_CAPTURE_PREPARE:
++      {
++        GError *err = NULL;
++        guint8 irq = 0;
++
++        if (!fpc_auto_gain_control (self, &err) ||
++            !fpc_cmd (_dev, 0xC0, &irq, &err))
++          {
++            fpi_ssm_mark_failed (ssm, err);
++            return;
++          }
++
++        fpi_ssm_next_state (ssm);
++      }
++      break;
++
++    case M_CAPTURE_READ:
++      {
++        GError *err = NULL;
++
++        if (!fpc_reg_read (_dev, 0xC4, 1, self->frame_buf, FRAME_SIZE, &err))
++          {
++            fp_err ("Full-frame SPI readout failed");
++            fpi_ssm_mark_failed (ssm, err);
++            return;
++          }
++
++        /* Restore AFD parameters after capture (0x1800034c7) */
++        fpc_set_afd_mode (_dev, NULL);
++
++        /* Apply 8-column boundary offset correction (0x180006fe8) */
++        fpc_correct_column_offsets (self->frame_buf, WIDTH, HEIGHT);
++
++        fp_dbg ("Captured full 160x160 frame (25600 bytes)");
++        fpi_ssm_next_state (ssm);
++      }
++      break;
++
++    case M_SUBMIT_IMAGE:
++      {
++        FpImage *orig = fp_image_new (WIDTH, HEIGHT);
++        if (orig)
++          {
++            orig->ppmm = 20.0;
++            orig->flags = FPI_IMAGE_PARTIAL;
++            memcpy (orig->data, self->frame_buf, FRAME_SIZE);
++
++            /* Stretch contrast using 1st/99th percentile bounds */
++            gint p_lo = 0, p_hi = 255;
++            hist_bounds (orig->data, FRAME_SIZE, &p_lo, &p_hi);
++            if (p_hi > p_lo + 10)
++              {
++                for (gint i = 0; i < FRAME_SIZE; i++)
++                  {
++                    gint v = orig->data[i];
++                    if (v <= p_lo)
++                      orig->data[i] = 0;
++                    else if (v >= p_hi)
++                      orig->data[i] = 255;
++                    else
++                      orig->data[i] = (guint8) (((v - p_lo) * 255) / (p_hi - p_lo));
++                  }
++              }
++
++            FpImage *scaled = fpi_image_resize (orig, ENLARGE_FACTOR, ENLARGE_FACTOR);
++            scaled->ppmm = 20.0 * ENLARGE_FACTOR;
++            scaled->flags = FPI_IMAGE_PARTIAL;
++            g_object_unref (orig);
++
++            fpi_image_device_image_captured (dev, scaled);
++          }
++        fpi_ssm_mark_completed (ssm);
++      }
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++fpc1021_samsung_dev_change_state (FpImageDevice *dev, FpiImageDeviceState state)
++{
++  FpiDeviceFpc1021Samsung *self = FPI_DEVICE_FPC1021_SAMSUNG (dev);
++
++  switch (state)
++    {
++    case FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON:
++      if (self->ssm == NULL)
++        {
++          self->ssm = fpi_ssm_new (FP_DEVICE (dev), m_loop_state, M_LOOP_NUM_STATES);
++          fpi_ssm_start (self->ssm, m_loop_complete);
++        }
++      break;
++
++    case FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF:
++      g_clear_pointer (&self->finger_off_source, g_source_destroy);
++      self->finger_off_source = fpi_device_add_timeout (FP_DEVICE (dev),
++                                                        50,
++                                                        finger_off_poll_cb,
++                                                        NULL,
++                                                        NULL);
++      break;
++
++    case FPI_IMAGE_DEVICE_STATE_INACTIVE:
++    case FPI_IMAGE_DEVICE_STATE_ACTIVATING:
++    case FPI_IMAGE_DEVICE_STATE_DEACTIVATING:
++    case FPI_IMAGE_DEVICE_STATE_IDLE:
++    case FPI_IMAGE_DEVICE_STATE_CAPTURE:
++    default:
++      break;
++    }
++}
++
++static const FpIdEntry id_table[] = {
++  { .vid = FPC1021_VID, .pid = FPC1021_PID, },
++  { .vid = 0, .pid = 0, .driver_data = 0 },
++};
++
++static void
++fpi_device_fpc1021_samsung_init (FpiDeviceFpc1021Samsung *self)
++{
++}
++
++static void
++fpi_device_fpc1021_samsung_class_init (FpiDeviceFpc1021SamsungClass *klass)
++{
++  FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
++  FpImageDeviceClass *img_class = FP_IMAGE_DEVICE_CLASS (klass);
++
++  dev_class->id = FP_COMPONENT;
++  dev_class->full_name = "Samsung Notebook FPC1025 Fingerprint Sensor";
++  dev_class->type = FP_DEVICE_TYPE_USB;
++  dev_class->id_table = id_table;
++  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
++
++  img_class->img_width = WIDTH * ENLARGE_FACTOR;
++  img_class->img_height = HEIGHT * ENLARGE_FACTOR;
++  img_class->bz3_threshold = 16;
++
++  img_class->img_open = fpc1021_samsung_dev_init;
++  img_class->img_close = fpc1021_samsung_dev_deinit;
++  img_class->activate = fpc1021_samsung_dev_activate;
++  img_class->deactivate = fpc1021_samsung_dev_deactivate;
++  img_class->change_state = fpc1021_samsung_dev_change_state;
++}
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index f11533c..9316496 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -123,6 +123,7 @@ driver_sources = {
+     'elanmoc' : files('drivers/elanmoc/elanmoc.c'),
+     'elanspi' : files('drivers/elanspi.c'),
+     'nb1010' : files('drivers/nb1010.c'),
++    'fpc1021_samsung' : files('drivers/fpc1021_samsung.c'),
+     'virtual_image' : files('drivers/virtual-image.c'),
+     'virtual_device' : files('drivers/virtual-device.c'),
+     'virtual_device_storage' : files('drivers/virtual-device-storage.c'),
+diff --git a/meson.build b/meson.build
+index ab09dc1..d09754e 100644
+--- a/meson.build
++++ b/meson.build
+@@ -142,6 +142,7 @@ drivers_info = {
+     'upekts': {},
+     'goodixmoc': {},
+     'nb1010': {},
++    'fpc1021_samsung': {},
+     'fpcmoc': {},
+     'realtek': {},
+     'focaltech_moc': {},
